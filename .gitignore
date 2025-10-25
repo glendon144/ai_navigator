@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+*.sqlite3
+.old_scripts
+old_scripts
+dist/
+build/
+*.spec
