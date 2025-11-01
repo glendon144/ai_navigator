@@ -2,7 +2,7 @@
 #
 # ai_navigator.py
 #
-# AI Navigator prototype (Archive + Recover + Reader Mode + OPML Outline + Reload)
+# AI Navigator prototype (Archive + Recover + Reader Mode + OPML Outline + Reload + Recover-to-ChatGPT + Recover Memory Weave)
 #
 # Layout:
 #   [ BrowserPane | ResultsPane | OutlinePane | AssistantPane ]
@@ -10,6 +10,9 @@
 # Capabilities:
 #   - Archive: capture current page into SQLite (raw + Reader Mode clean_html).
 #   - Recover: load a stored snapshot into the browser offline.
+#   - Recover to ChatGPT: copy a compact Context Capsule for the selected snapshot
+#                         and open chatgpt.com for a paste-and-go resume.
+#   - Recover Memory Weave: copy a 3-item recent thread (prefer same domain) and open chatgpt.com.
 #   - Outline: browse archive_export.opml as a clickable knowledge tree.
 #       Clicking a node with _local_id pulls that snapshot from SQLite
 #       and renders it offline in BrowserPane.
@@ -19,10 +22,14 @@
 
 import sys
 import re
+import os
+import webbrowser
+import subprocess
 import sqlite3
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 
 from PySide6.QtCore import (
     Qt,
@@ -40,6 +47,9 @@ from PySide6.QtGui import (
     QColor,
     QTransform,
     QPainterPath,
+    QGuiApplication,
+    QDesktopServices,
+    QClipboard,  # added for Selection mode
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -59,22 +69,36 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from bs4 import BeautifulSoup  # NEW: for OPML export parsing
+
+# Initializes storage/ and ensures archive_pages exists (same schema used below).
+# This module is already part of your project.
 from init_db import init_db_if_needed
 
 init_db_if_needed()
 
-DB_PATH = Path("search_time_machine.db")
+# IMPORTANT: Your DB is created in storage/search_time_machine.db by init_db.py.
+# Keep this path in sync with that module.
+DB_PATH = Path("storage") / "search_time_machine.db"
 DEFAULT_OPML_PATH = "archive_export.opml"
+
+K_WEAVE = 3  # Recover Memory Weave count
 
 
 def ensure_archive_table(db_path: Path):
     """
-    Make sure the archive_pages table exists, and migrate it if needed to add clean_html.
+    Make sure the archive_pages table exists (matches init_db.py).
+    Columns:
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT,
+        title TEXT,
+        captured_at TEXT,
+        snippet TEXT,
+        html TEXT,
+        clean_html TEXT
     """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-
-    # Base table
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS archive_pages (
@@ -88,14 +112,10 @@ def ensure_archive_table(db_path: Path):
         );
         """
     )
-
-    # Migration safety: old DBs might not have clean_html yet.
     try:
         cur.execute("ALTER TABLE archive_pages ADD COLUMN clean_html TEXT;")
     except sqlite3.OperationalError:
-        # Column already exists, which is fine.
         pass
-
     conn.commit()
     conn.close()
 
@@ -119,28 +139,17 @@ def html_to_snippet(html: str, max_len: int = 500) -> str:
 def sanitize_html_for_reader(raw_html: str) -> str:
     """
     Reader Mode: preserves narrative, removes instrumentation.
-
     We strip:
-    - <script>...</script>
-    - <iframe>...</iframe>
-    - preload / preconnect / dns-prefetch link tags
-    - inline JS event handlers like onclick="..."
-
-    The goal is a stable, self-contained document that's still readable
-    years from now, and doesn't try to phone home or throw paywall overlays.
-    This is the canonical body we plan to expose to outlines / PiKit.
+      - <script>...</script>
+      - <iframe>...</iframe>
+      - preload / preconnect / dns-prefetch link tags
+      - inline JS event handlers like onclick="..."
     """
     cleaned = re.sub(
-        r"<script.*?</script>",
-        "",
-        raw_html,
-        flags=re.IGNORECASE | re.DOTALL,
+        r"<script.*?</script>", "", raw_html, flags=re.IGNORECASE | re.DOTALL
     )
     cleaned = re.sub(
-        r"<iframe.*?</iframe>",
-        "",
-        cleaned,
-        flags=re.IGNORECASE | re.DOTALL,
+        r"<iframe.*?</iframe>", "", cleaned, flags=re.IGNORECASE | re.DOTALL
     )
     cleaned = re.sub(
         r"<link[^>]+rel=[\"']?(preload|dns-prefetch|preconnect|modulepreload)[\"']?[^>]*>",
@@ -148,12 +157,8 @@ def sanitize_html_for_reader(raw_html: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
-    # remove inline handlers like onclick="..." onmouseover="..." etc.
     cleaned = re.sub(
-        r"\son\w+\s*=\s*['\"].*?['\"]",
-        "",
-        cleaned,
-        flags=re.IGNORECASE | re.DOTALL,
+        r"\son\w+\s*=\s*['\"].*?['\"]", "", cleaned, flags=re.IGNORECASE | re.DOTALL
     )
     return cleaned
 
@@ -182,16 +187,100 @@ def save_archive_page(db_path: Path, url: str, title: str, html: str):
     conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Clipboard helper (Qt + X11 fallbacks)  [FIXED for PySide6]
+# ---------------------------------------------------------------------------
+
+
+def copy_to_clipboard(text: str) -> bool:
+    """
+    Try Qt clipboard (Clipboard + Selection), then fall back to xclip/xsel on X11.
+    Returns True if we *believe* it landed on a clipboard.
+    """
+    ok = False
+    try:
+        cb = QGuiApplication.clipboard()
+        if cb is not None:
+            # Default clipboard
+            cb.setText(text or "")
+            # Primary selection for X11 (ignore if unsupported)
+            try:
+                cb.setText(text or "", mode=QClipboard.Mode.Selection)
+            except Exception:
+                pass
+            ok = True
+    except Exception:
+        ok = False
+
+    if ok:
+        return True
+
+    # X11 fallbacks (no harm if not installed)
+    for cmd in (
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ):
+        try:
+            p = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            p.communicate(input=(text or "").encode("utf-8"), timeout=1.5)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
+# OPML export helpers (NEW)
+# ---------------------------------------------------------------------------
+
+
+def _slug(s: str) -> str:
+    s = re.sub(r"\s+", "-", (s or "").strip())
+    s = re.sub(r"[^A-Za-z0-9\-_]+", "", s)
+    return s or "page"
+
+
+def _html_to_opml(html: str, title: str) -> str:
+    soup = BeautifulSoup(html or "", "lxml")
+    doc_title = (title or (soup.title.string if soup.title else "")) or "Untitled"
+    nodes = []
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        level = int(tag.name[1])
+        text = tag.get_text(" ", strip=True)
+        if text:
+            nodes.append((level, text))
+
+    out = [
+        '<?xml version="1.0"?>',
+        '<opml version="2.0"><head>',
+        f"<title>{doc_title}</title>",
+        "</head><body>",
+    ]
+
+    stack = [0]
+    for level, text in nodes:
+        while stack and level <= stack[-1]:
+            out.append("</outline>")
+            stack.pop()
+        out.append(f'<outline text="{text}">')
+        stack.append(level)
+
+    while len(stack) > 1:
+        out.append("</outline>")
+        stack.pop()
+
+    out.append("</body></opml>")
+    return "\n".join(out)
+
+
 class ThrobberWidget(QWidget):
     """
     Rotating "A" throbber for AI Navigator.
-
-    start() -> spins
-    stop()  -> freezes
-
-    Internals:
-    We draw an "A" in a teal/navy circle once to a QPixmap. Then we just
-    rotate that pixmap in paintEvent() using a QTransform, driven by a QTimer.
     """
 
     def __init__(self, parent=None, size=24):
@@ -212,13 +301,11 @@ class ThrobberWidget(QWidget):
         painter = QPainter(pm)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # Background circle: deep teal/navy ringed with light border
         circle_color = QColor(0, 60, 90)
         painter.setBrush(QBrush(circle_color))
         painter.setPen(QPen(QColor(200, 230, 255), 1))
         painter.drawEllipse(QRect(1, 1, size - 2, size - 2))
 
-        # Stylized "A"
         painter.setPen(Qt.white)
         painter.setBrush(Qt.white)
 
@@ -232,7 +319,6 @@ class ThrobberWidget(QWidget):
         tri_path.closeSubpath()
         painter.drawPath(tri_path)
 
-        # Crossbar of the "A"
         bar_x = 0.33 * w
         bar_y = 0.55 * h
         bar_w = 0.34 * w
@@ -283,13 +369,6 @@ class BrowserPane(QWidget):
       Toolbar (Back, Forward, Reload, Home, URL, Go, Archive, Throbber)
       QWebEngineView
       Status line
-
-    load_html_snapshot(html, base_url) lets us display archived snapshots
-    offline in Reader Mode.
-
-    We talk to MainWindow via callbacks:
-      on_page_loaded(url_str)
-      on_archive_request(url, title, html)
     """
 
     def __init__(self, on_page_loaded=None, on_archive_request=None):
@@ -298,7 +377,6 @@ class BrowserPane(QWidget):
         self.on_page_loaded = on_page_loaded
         self.on_archive_request = on_archive_request
 
-        # Core widgets
         self.view = QWebEngineView()
 
         self.url_bar = QLineEdit()
@@ -308,6 +386,7 @@ class BrowserPane(QWidget):
         self.reload_button = QPushButton("Reload")
         self.home_button = QPushButton("Home")
         self.archive_button = QPushButton("Archive")
+        self.opml_button = QPushButton("Outline (OPML export)")  # NEW button
         self.throbber = ThrobberWidget(size=24)
 
         self.status_label = QLabel("Ready.")
@@ -316,7 +395,6 @@ class BrowserPane(QWidget):
         )
         self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        # Toolbar row
         toolbar_row = QHBoxLayout()
         toolbar_bg = QWidget()
         toolbar_bg.setStyleSheet(
@@ -343,6 +421,7 @@ class BrowserPane(QWidget):
             self.home_button,
             self.go_button,
             self.archive_button,
+            self.opml_button,  # style new button
         ):
             b.setStyleSheet(btn_style)
 
@@ -364,9 +443,9 @@ class BrowserPane(QWidget):
         toolbar_row.addWidget(self.url_bar, stretch=1)
         toolbar_row.addWidget(self.go_button)
         toolbar_row.addWidget(self.archive_button)
+        toolbar_row.addWidget(self.opml_button)  # add to toolbar
         toolbar_row.addWidget(self.throbber)
 
-        # Status row
         status_row = QHBoxLayout()
         status_bg = QWidget()
         status_bg.setStyleSheet(
@@ -375,7 +454,6 @@ class BrowserPane(QWidget):
         status_bg.setLayout(status_row)
         status_row.addWidget(self.status_label)
 
-        # Main layout (vertical)
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(toolbar_bg)
@@ -383,10 +461,7 @@ class BrowserPane(QWidget):
         layout.addWidget(status_bg)
         self.setLayout(layout)
 
-        # Default homepage
         self.home_url = "https://www.google.com/"
-
-        # Hook up controls
         self.go_button.clicked.connect(self.load_url)
         self.url_bar.returnPressed.connect(self.load_url)
         self.back_button.clicked.connect(self.view.back)
@@ -394,13 +469,12 @@ class BrowserPane(QWidget):
         self.reload_button.clicked.connect(self.view.reload)
         self.home_button.clicked.connect(self.load_home)
         self.archive_button.clicked.connect(self._archive_current_page)
+        self.opml_button.clicked.connect(self._export_outline_opml)  # NEW
 
-        # Web load signals
         self.view.loadStarted.connect(self._on_load_started)
         self.view.loadProgress.connect(self._on_load_progress)
         self.view.loadFinished.connect(self._on_load_finished)
 
-        # Initial page
         self.url_bar.setText(self.home_url)
         self.load_url()
 
@@ -412,13 +486,9 @@ class BrowserPane(QWidget):
         url = self.url_bar.text().strip()
         if not url.startswith("http"):
             url = "https://" + url
-        self.view.setUrl(url)
+        self.view.setUrl(QUrl(url))
 
     def load_html_snapshot(self, html: str, base_url: str):
-        """
-        Render an archived snapshot (Reader Mode) with no live network requirement.
-        base_url seeds the origin so relative paths don't completely freak out.
-        """
         self.view.setHtml(html, baseUrl=QUrl(base_url))
         self.status_label.setText("Loaded Reader-Mode snapshot (offline).")
         self.url_bar.setText(base_url)
@@ -443,9 +513,6 @@ class BrowserPane(QWidget):
             QMessageBox.warning(self, "Load error", "Page failed to load.")
 
     def _archive_current_page(self):
-        """
-        Ask QWebEngineView for the current DOM HTML and hand it to MainWindow.
-        """
         current_url = self.view.url().toString()
         current_title = self.view.title() or current_url
 
@@ -455,6 +522,27 @@ class BrowserPane(QWidget):
 
         self.view.page().toHtml(got_html)
 
+    # NEW: robust OPML export handler
+    def _export_outline_opml(self):
+        """Export the visible page's heading outline to ./archives/opml/*.opml"""
+
+        def _on_html(html: str):
+            try:
+                title = self.view.title() or ""
+                opml = _html_to_opml(html, title)
+                outdir = Path.cwd() / "archives" / "opml"
+                outdir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                name = f"{_slug(title)}-{ts}.opml"
+                outpath = outdir / name
+                outpath.write_text(opml, encoding="utf-8")
+                self.status_label.setText(f"OPML saved → {outpath}")
+                QMessageBox.information(self, "OPML export", f"Saved:\n{outpath}")
+            except Exception as e:
+                QMessageBox.critical(self, "OPML export failed", str(e))
+
+        self.view.page().toHtml(_on_html)
+
 
 class ResultsPane(QWidget):
     """
@@ -462,9 +550,10 @@ class ResultsPane(QWidget):
 
     Top: list of archived snapshots (title + timestamp).
     Bottom: detail box (URL + snippet preview).
-    Button: Recover (loads snapshot back into BrowserPane in Reader Mode).
-
-    recoveredPage(html, url) is emitted when user hits Recover.
+    Buttons:
+      - Recover (load snapshot locally)
+      - Recover to ChatGPT (copy Capsule + open chatgpt.com)
+      - Recover Memory Weave (copy 3-item thread + open chatgpt.com)
     """
 
     recoveredPage = Signal(str, str)  # html, url
@@ -475,12 +564,13 @@ class ResultsPane(QWidget):
         self.db_path = db_path
         self.conn = None
 
-        # widgets
         self.archive_list = QListWidget()
         self.details_list = QListWidget()
-        self.recover_button = QPushButton("Recover")
 
-        # chrome labels
+        self.recover_button = QPushButton("Recover")
+        self.recover_chat_button = QPushButton("Recover to ChatGPT")
+        self.recover_weave_button = QPushButton("Recover Memory Weave")
+
         header_label = QLabel("Archived Pages")
         header_label.setStyleSheet(
             "font-weight: bold; background-color: #003c5a; color: #ffffff; padding: 4px;"
@@ -490,8 +580,7 @@ class ResultsPane(QWidget):
             "font-weight: bold; background-color: #003c5a; color: #ffffff; padding: 4px;"
         )
 
-        # style button
-        self.recover_button.setStyleSheet(
+        btn_style = (
             "QPushButton {"
             "  background-color: #195b7e;"
             "  color: #ffffff;"
@@ -503,18 +592,25 @@ class ResultsPane(QWidget):
             "  background-color: #0f3b52;"
             "}"
         )
+        for b in (
+            self.recover_button,
+            self.recover_chat_button,
+            self.recover_weave_button,
+        ):
+            b.setStyleSheet(btn_style)
 
-        # layout
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
 
         layout.addWidget(header_label)
         layout.addWidget(self.archive_list, stretch=1)
 
-        # row with "Details" label and Recover button on same line
+        # Row: Details label + buttons on the right
         details_header_row = QHBoxLayout()
         details_header_row.addWidget(details_label)
         details_header_row.addStretch(1)
+        details_header_row.addWidget(self.recover_weave_button)
+        details_header_row.addWidget(self.recover_chat_button)
         details_header_row.addWidget(self.recover_button)
 
         layout.addLayout(details_header_row)
@@ -522,11 +618,11 @@ class ResultsPane(QWidget):
 
         self.setLayout(layout)
 
-        # signals
         self.archive_list.currentItemChanged.connect(self._populate_details_for_archive)
         self.recover_button.clicked.connect(self._recover_selected)
+        self.recover_chat_button.clicked.connect(self._recover_to_chatgpt_selected)
+        self.recover_weave_button.clicked.connect(self._recover_memory_weave_selected)
 
-        # init db + load list
         self._ensure_connection()
         self._populate_archive_list()
 
@@ -536,85 +632,58 @@ class ResultsPane(QWidget):
             self.conn = sqlite3.connect(self.db_path)
 
     def _populate_archive_list(self):
-        """
-        Fill archive_list from archive_pages, newest first.
-        """
         self.archive_list.clear()
         if self.conn is None:
             return
-
         cur = self.conn.cursor()
         cur.execute(
             """
             SELECT id, title, captured_at
             FROM archive_pages
             ORDER BY captured_at DESC
-            LIMIT 100;
+            LIMIT 200;
             """
         )
-        rows = cur.fetchall()
-        for page_id, title, captured_at in rows:
+        for page_id, title, captured_at in cur.fetchall():
             label = f"{title}    ({captured_at})"
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, page_id)
             self.archive_list.addItem(item)
 
     def _populate_details_for_archive(
-        self,
-        current: QListWidgetItem,
-        previous: QListWidgetItem,
+        self, current: QListWidgetItem, previous: QListWidgetItem
     ):
-        """
-        When user clicks an archived page, show URL + snippet.
-        """
         self.details_list.clear()
         if self.conn is None or current is None:
             return
-
         page_id = current.data(Qt.UserRole)
         cur = self.conn.cursor()
         cur.execute(
-            """
-            SELECT url, snippet
-            FROM archive_pages
-            WHERE id = ?;
-            """,
+            "SELECT url, snippet FROM archive_pages WHERE id = ?;",
             (page_id,),
         )
         row = cur.fetchone()
         if not row:
             return
-
         url, snippet = row
         preview_text = f"{url}\n\n{snippet}"
         self.details_list.addItem(QListWidgetItem(preview_text))
 
     def _recover_selected(self):
-        """
-        User hit Recover.
-        Look up clean_html (Reader Mode) + URL for the selected snapshot,
-        then emit recoveredPage(html, url).
-        Falls back to raw html if clean_html is NULL.
-        """
         if self.conn is None:
             QMessageBox.warning(self, "No DB", "Database not available.")
             return
-
         current_item = self.archive_list.currentItem()
         if current_item is None:
             QMessageBox.information(
-                self,
-                "No selection",
-                "Select an archived page first.",
+                self, "No selection", "Select an archived page first."
             )
             return
-
         page_id = current_item.data(Qt.UserRole)
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT url,
-                   COALESCE(clean_html, html)
+            SELECT url, COALESCE(clean_html, html)
             FROM archive_pages
             WHERE id = ?;
             """,
@@ -628,30 +697,334 @@ class ResultsPane(QWidget):
                 "That archived page no longer exists in the database.",
             )
             return
-
         url, html_for_reader = row
         self.recoveredPage.emit(html_for_reader, url)
 
+    # --- Recover-to-ChatGPT: build a compact Context Capsule and open chatgpt.com ---
+    def _recover_to_chatgpt_selected(self):
+        try:
+            if self.conn is None:
+                QMessageBox.warning(self, "No DB", "Database not available.")
+                return
+            item = self.archive_list.currentItem()
+            if item is None:
+                QMessageBox.information(
+                    self, "No selection", "Select an archived page first."
+                )
+                return
+
+            page_id = item.data(Qt.UserRole)
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT title, url, captured_at, snippet, COALESCE(clean_html, html)
+                FROM archive_pages
+                WHERE id = ?;
+                """,
+                (page_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                QMessageBox.warning(
+                    self, "Not found", "That archived page no longer exists."
+                )
+                return
+
+            title, url, captured_at, snippet, body = row
+            capsule = build_context_capsule_for_snapshot(
+                title=title or url or "(untitled)",
+                url=url or "about:blank",
+                captured_at=captured_at or "",
+                snippet=snippet or "",
+                body=body or "",
+                hard_cap_chars=6500,
+            )
+
+            copied = copy_to_clipboard(capsule)
+
+            target = "https://chatgpt.com/"
+            opened = QDesktopServices.openUrl(QUrl(target))
+            if not opened:
+                if not webbrowser.open_new_tab(target):
+                    try:
+                        subprocess.Popen(
+                            ["xdg-open", target],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        pass
+
+            if copied:
+                QMessageBox.information(
+                    self,
+                    "Capsule ready",
+                    "Context Capsule copied to clipboard.\n"
+                    "Switch to the ChatGPT tab and paste to resume.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Clipboard problem",
+                    "Couldn't access the system clipboard.\n\n"
+                    "Tip: install xclip or xsel (Linux) for a reliable fallback,\n"
+                    "or just paste from the last successful copy if it's still there.",
+                )
+        except Exception as e:
+            QMessageBox.critical(self, "Recover to ChatGPT failed", str(e))
+
+    # --- Recover Memory Weave: build a 3-item thread and open chatgpt.com ---
+    def _recover_memory_weave_selected(self):
+        try:
+            if self.conn is None:
+                QMessageBox.warning(self, "No DB", "Database not available.")
+                return
+            item = self.archive_list.currentItem()
+            if item is None:
+                QMessageBox.information(
+                    self, "No selection", "Select an archived page first."
+                )
+                return
+
+            page_id = item.data(Qt.UserRole)
+
+            capsule = build_memory_weave_packet(
+                self.conn, page_id, k=K_WEAVE, hard_cap_chars=7000
+            )
+
+            copied = copy_to_clipboard(capsule)
+
+            target = "https://chatgpt.com/"
+            opened = QDesktopServices.openUrl(QUrl(target))
+            if not opened:
+                if not webbrowser.open_new_tab(target):
+                    try:
+                        subprocess.Popen(
+                            ["xdg-open", target],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        pass
+
+            if copied:
+                QMessageBox.information(
+                    self,
+                    "Weave ready",
+                    "Memory Weave copied to clipboard (k=3).\n"
+                    "Switch to the ChatGPT tab and paste to resume.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Clipboard problem",
+                    "Couldn't access the system clipboard.\n\n"
+                    "Tip: install xclip or xsel (Linux) for a reliable fallback.",
+                )
+        except Exception as e:
+            QMessageBox.critical(self, "Recover Memory Weave failed", str(e))
+
     def refresh_all(self):
-        """
-        Call this after inserting a new archive row.
-        """
         if self.conn is None:
             self._ensure_connection()
         self._populate_archive_list()
-        # details_list will update on selection; we don't auto-select.
+
+
+def _clean_for_capsule(s: str) -> str:
+    s = s.replace("```", "ʼʼʼ")  # avoid nested fence breakage
+    s = re.sub(r"\s+\n", "\n", s)
+    return s.strip()
+
+
+def build_context_capsule_for_snapshot(
+    *,
+    title: str,
+    url: str,
+    captured_at: str,
+    snippet: str,
+    body: str,
+    hard_cap_chars: int = 6500,
+) -> str:
+    """
+    Build a one-shot Markdown capsule suitable for pasting into a new ChatGPT chat.
+    We include:
+      - Header: title, URL, captured timestamp
+      - Brief snippet (plain text)
+      - Slice of cleaned Reader-Mode HTML (as fenced block), size-capped
+      - A tiny footer instruction so the assistant continues from context
+    """
+    title = _clean_for_capsule(title)
+    url = _clean_for_capsule(url)
+    snippet = _clean_for_capsule(snippet)
+    body = _clean_for_capsule(body)
+
+    # Keep a small portion of body for safety; HTML can be long.
+    max_body = max(0, min(5200, hard_cap_chars - 1000))
+    body_slice = body[:max_body]
+
+    header = (
+        f"### Context Capsule — ai_navigator\n"
+        f"Title: {title}\n"
+        f"URL: {url}\n"
+        f"Captured: {captured_at}\n"
+        f"---\n"
+    )
+
+    snippet_block = ""
+    if snippet:
+        snippet_block = f"**Snippet**\n{snippet}\n\n"
+
+    html_block = f"**Reader-Mode HTML (excerpt)**\n```html\n{body_slice}\n```\n"
+
+    footer = (
+        "\nContinue from this capsule. Summarize key points from the page, "
+        "then propose the next 1–2 actions or questions. If anything is unclear, "
+        "ask for the single most relevant detail rather than restarting."
+    )
+
+    capsule = header + snippet_block + html_block + footer
+    # Final additional cap if somehow exceeded
+    if len(capsule) > hard_cap_chars:
+        capsule = capsule[: hard_cap_chars - 25] + "\n…[truncated]…"
+    return capsule
+
+
+def build_memory_weave_packet(
+    conn: sqlite3.Connection,
+    current_page_id: int,
+    k: int = 3,
+    hard_cap_chars: int = 7000,
+) -> str:
+    """
+    Build a 3-item "Memory Weave" capsule:
+      - Prefer the last k captures from the SAME DOMAIN as the selected item.
+      - If fewer than k exist, fall back to global recents to fill up.
+      - Include title, URL, timestamp, and a short snippet for each.
+    """
+    cur = conn.cursor()
+
+    # Fetch the selected page info
+    cur.execute(
+        "SELECT url, title, captured_at, snippet FROM archive_pages WHERE id = ?;",
+        (current_page_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        # Fallback: just use the latest k globally
+        return build_global_weave_packet(conn, k=k, hard_cap_chars=hard_cap_chars)
+
+    sel_url, sel_title, sel_captured_at, sel_snippet = row
+    domain = urlparse(sel_url or "").netloc.lower()
+
+    items = []
+
+    # Prefer same-domain recents
+    if domain:
+        cur.execute(
+            """
+            SELECT id, title, url, captured_at, snippet
+            FROM archive_pages
+            WHERE url LIKE ? 
+            ORDER BY captured_at DESC
+            LIMIT ?;
+            """,
+            (f"%://{domain}%", k),
+        )
+        items = cur.fetchall()
+
+    # If not enough, top up with global recents excluding duplicates
+    if len(items) < k:
+        have_ids = {r[0] for r in items}
+        need = k - len(items)
+        cur.execute(
+            """
+            SELECT id, title, url, captured_at, snippet
+            FROM archive_pages
+            ORDER BY captured_at DESC
+            LIMIT ?;
+            """,
+            (k * 3,),  # grab a bit more to avoid dup fill
+        )
+        for r in cur.fetchall():
+            if r[0] not in have_ids:
+                items.append(r)
+                if len(items) >= k:
+                    break
+
+    # Build the weave text
+    header = "### Context Capsule — ai_navigator\n"
+    if domain:
+        header += f"Thread scope: {domain}\n"
+    header += f"Captured: {datetime.utcnow().isoformat(timespec='seconds')}Z\n---\n"
+
+    lines = []
+    for _id, title, url, ts, snip in items:
+        title = _clean_for_capsule(title or "(untitled)")
+        url = _clean_for_capsule(url or "")
+        ts = _clean_for_capsule(ts or "")
+        snip = _clean_for_capsule((snip or "")[:240])
+        lines.append(f"— {ts} · {title} · {url}")
+        if snip:
+            lines.append(f"   {snip}")
+
+    footer = (
+        "\n(End of memory weave)\n\n"
+        "Continue from these three context points. Summarize the through-line you infer, "
+        "then propose the next one or two actions."
+    )
+
+    capsule = header + "\n".join(lines) + "\n" + footer
+    if len(capsule) > hard_cap_chars:
+        capsule = capsule[: hard_cap_chars - 25] + "\n…[truncated]…"
+    return capsule
+
+
+def build_global_weave_packet(
+    conn: sqlite3.Connection, k: int = 3, hard_cap_chars: int = 7000
+) -> str:
+    """
+    Fallback when selected item missing: global last k recents.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, title, url, captured_at, snippet
+        FROM archive_pages
+        ORDER BY captured_at DESC
+        LIMIT ?;
+        """,
+        (k,),
+    )
+    rows = cur.fetchall()
+
+    header = "### Context Capsule — ai_navigator\nThread scope: global\n"
+    header += f"Captured: {datetime.utcnow().isoformat(timespec='seconds')}Z\n---\n"
+
+    lines = []
+    for _id, title, url, ts, snip in rows:
+        title = _clean_for_capsule(title or "(untitled)")
+        url = _clean_for_capsule(url or "")
+        ts = _clean_for_capsule(ts or "")
+        snip = _clean_for_capsule((snip or "")[:240])
+        lines.append(f"— {ts} · {title} · {url}")
+        if snip:
+            lines.append(f"   {snip}")
+
+    footer = (
+        "\n(End of memory weave)\n\n"
+        "Continue from these three context points. Summarize the through-line you infer, "
+        "then propose the next one or two actions."
+    )
+
+    capsule = header + "\n".join(lines) + "\n" + footer
+    if len(capsule) > hard_cap_chars:
+        capsule = capsule[: hard_cap_chars - 25] + "\n…[truncated]…"
+    return capsule
 
 
 class OutlinePane(QWidget):
     """
     OPML Outline browser.
-
-    Loads archive_export.opml (newest-first outline of your captured web),
-    shows it as a tree. Clicking a node that has _local_id will open the
-    corresponding snapshot (Reader Mode) directly in BrowserPane.
-
-    Now also includes a 'Reload' button so we can re-parse a freshly
-    exported OPML without restarting AI Navigator.
     """
 
     def __init__(
@@ -660,7 +1033,7 @@ class OutlinePane(QWidget):
         super().__init__()
 
         self.db_path = db_path
-        self.on_open_local = on_open_local  # callback(local_id:int)
+        self.on_open_local = on_open_local
         self.opml_path = opml_path
 
         self.tree = QTreeWidget()
@@ -696,19 +1069,13 @@ class OutlinePane(QWidget):
         layout.addWidget(self.tree, stretch=1)
         self.setLayout(layout)
 
-        # populate once
         self._populate_tree_from_opml()
 
-        # react to user actions
         self.tree.itemActivated.connect(self._handle_activate)
         self.reload_button.clicked.connect(self.reload_outline)
 
     def _populate_tree_from_opml(self):
-        """
-        Clear current tree and repopulate it from self.opml_path.
-        """
         self.tree.clear()
-
         try:
             doc = ET.parse(self.opml_path)
         except Exception as e:
@@ -724,58 +1091,37 @@ class OutlinePane(QWidget):
         def add_outline_element(xml_el, parent_item=None):
             if xml_el.tag != "outline":
                 return
-
             text = xml_el.attrib.get("text", "(untitled)")
             item = QTreeWidgetItem([text])
-
-            # stash metadata for click handling (_local_id, url, etc.)
             item.setData(0, Qt.UserRole, xml_el.attrib)
-
             if parent_item is None:
                 self.tree.addTopLevelItem(item)
             else:
                 parent_item.addChild(item)
-
-            # recurse children
             for child in xml_el.findall("./outline"):
                 add_outline_element(child, item)
 
         for top in body.findall("./outline"):
             add_outline_element(top, None)
 
-        # modest auto-expand so you can browse
         self.tree.expandToDepth(1)
 
     def reload_outline(self):
-        """
-        Public method: re-parse archive_export.opml, refresh the tree display.
-        Intended to be called after you regenerate the OPML externally
-        using aopmlengine.py.
-        """
         self._populate_tree_from_opml()
 
     def _handle_activate(self, item, column):
-        """
-        When the user activates a tree node, check if that outline node
-        had a _local_id attribute. If so, ask MainWindow to open it.
-        """
         attrs = item.data(0, Qt.UserRole) or {}
         local_id = attrs.get("_local_id")
         if local_id and self.on_open_local:
             try:
                 self.on_open_local(int(local_id))
             except ValueError:
-                pass  # if somehow it's non-numeric we just ignore
+                pass
 
 
 class AssistantPane(QWidget):
     """
-    Assistant / commentary pane.
-
-    Eventually this becomes:
-    - diff between two captures of the same URL
-    - propaganda / rhetoric analysis
-    - summary for future readers
+    Assistant / commentary pane (placeholder UI).
     """
 
     def __init__(self):
@@ -811,30 +1157,20 @@ class AssistantPane(QWidget):
         question = self.input_line.text().strip()
         if not question:
             return
-
         response_text = (
             "AI Navigator says:\n\n"
-            "The Outline pane is now live-updating. You can regenerate the OPML "
-            "export from your archive, hit Reload, and keep exploring that "
-            "snapshot web without restarting.\n\n"
-            "Soon: pick two captures of the same URL and I'll diff them so you "
-            "can watch the narrative mutate over time."
+            "The Outline pane is live-updating. Regenerate the OPML, hit Reload, "
+            "and keep exploring snapshots without restarting.\n\n"
+            "Soon: pick two captures of the same URL and I'll diff them so you can "
+            "watch the narrative mutate over time."
         )
-
         self.output_box.setPlainText(response_text)
 
 
 class MainWindow(QWidget):
     """
-    Top-level container.
-
     4-pane layout:
       BrowserPane | ResultsPane | OutlinePane | AssistantPane
-
-    Responsibilities:
-      - Save a page into SQLite (Archive).
-      - Recover a snapshot from ResultsPane.
-      - Open a snapshot by _local_id from the OPML OutlinePane.
     """
 
     def __init__(self):
@@ -843,7 +1179,6 @@ class MainWindow(QWidget):
         self.setWindowTitle("AI Navigator")
         self.setMinimumSize(QSize(1600, 900))
 
-        # Panes
         self.results_pane = ResultsPane(DB_PATH)
         self.assistant_pane = AssistantPane()
         self.browser_pane = BrowserPane(
@@ -856,12 +1191,7 @@ class MainWindow(QWidget):
             opml_path=DEFAULT_OPML_PATH,
         )
 
-        # When user hits Recover in ResultsPane, replay snapshot in BrowserPane.
         self.results_pane.recoveredPage.connect(self._handle_recovered_page)
-
-        # Layout:
-        # outer_splitter: [ browser_pane | mid_splitter ]
-        # mid_splitter:   [ results_pane | outline_pane | assistant_pane ]
 
         mid_splitter = QSplitter(Qt.Horizontal)
         mid_splitter.addWidget(self.results_pane)
@@ -880,35 +1210,19 @@ class MainWindow(QWidget):
         self.setLayout(main_layout)
 
     def _handle_page_loaded(self, url_str: str):
-        """
-        Hook point: eventually auto-archive search result pages,
-        diff snapshots over time, etc.
-        """
+        # Hook point for future auto-archive/diff logic.
         pass
 
     def _handle_archive_request(self, url: str, title: str, html: str):
-        """
-        BrowserPane called Archive.
-        Persist snapshot (with clean_html), then refresh the ResultsPane list
-        so it appears immediately.
-        """
         save_archive_page(DB_PATH, url, title, html)
         self.results_pane.refresh_all()
-        # After you rerun aopmlengine.py to export a new archive_export.opml,
-        # hit "Reload" in OutlinePane to see the new stuff.
+        # After you regenerate archive_export.opml externally,
+        # hit "Reload" in OutlinePane to see new items.
 
     def _handle_recovered_page(self, html: str, url: str):
-        """
-        ResultsPane emitted recoveredPage(html, url) from Recover button.
-        Push that cleaned HTML into the browser pane for offline viewing.
-        """
         self.browser_pane.load_html_snapshot(html, url)
 
     def _open_local_snapshot_by_id(self, row_id: int):
-        """
-        OutlinePane asked us to open a specific archived snapshot ID.
-        Look up clean_html (fallback html) from SQLite, then show it.
-        """
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute(
@@ -923,11 +1237,7 @@ class MainWindow(QWidget):
         conn.close()
 
         if not row:
-            QMessageBox.warning(
-                self,
-                "Not found",
-                f"No snapshot with id {row_id}",
-            )
+            QMessageBox.warning(self, "Not found", f"No snapshot with id {row_id}")
             return
 
         url, html_for_reader = row
@@ -935,6 +1245,8 @@ class MainWindow(QWidget):
 
 
 def main():
+    # Helps on some Linux desktops where WebEngine sandbox trips:
+    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox")
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
@@ -943,3 +1255,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Optional: expose DB_PATH for other modules if they want it.
+__all__ = ["init_db_if_needed", "DB_PATH"]

@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<opml version="2.0"><head>
+<title>AI Navigator conversation</title>
+</head><body>
+<outline text="Chat history">
+</outline>
+<outline text="GPTs">
+</outline>
+<outline text="Projects">
+</outline>
+<outline text="Chats">
+<outline text="You said:">
+<outline text="ChatGPT said:">
+</outline>
+</outline>
+<outline text="You said:">
+<outline text="ChatGPT said:">
+</outline>
+</outline>
+<outline text="You said:">
+<outline text="ChatGPT said:">
+</outline>
+</outline>
+</outline>
+</body></opml>
