@@ -8,3 +8,7 @@ old_scripts
 dist/
 build/
 *.spec
+
+# SQLite sidecars
+storage/*.db-shm
+storage/*.db-wal
