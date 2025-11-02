@@ -12,3 +12,8 @@ build/
 # SQLite sidecars
 storage/*.db-shm
 storage/*.db-wal
+
+# SQLite sidecars
+storage/*.db-shm
+storage/*.db-wal
+
