@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<opml version="2.0"><head>
+<title>Console output analysis</title>
+</head><body>
+<outline text="Chat history">
+</outline>
+<outline text="GPTs">
+</outline>
+<outline text="Projects">
+</outline>
+<outline text="Chats">
+<outline text="You said:">
+<outline text="ChatGPT said:">
+</outline>
+</outline>
+</outline>
+<outline text="What the messages mean (plain English)">
+</outline>
+<outline text="Single-path, do-this fix">
+</outline>
+<outline text="Tiny checklist you can run right now">
+</outline>
+</body></opml>

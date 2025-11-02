@@ -30,6 +30,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
+import threading
+import time
 
 from PySide6.QtCore import (
     Qt,
@@ -235,6 +237,82 @@ def copy_to_clipboard(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# OpenVPN controller (systemd-managed openvpn-client@ainav.service)
+# ---------------------------------------------------------------------------
+
+
+class VPNController:
+    """
+    Minimal controller for a single OpenVPN client managed by systemd:
+      openvpn-client@ainav.service
+
+    Exposes:
+      - is_active(): systemd thinks VPN is running
+      - has_tun(): a tun interface is present / default route via tun
+      - start(), stop()
+      - ensure_connected(timeout_s=20)
+    """
+
+    def __init__(self, unit_name="openvpn-client@ainav"):
+        self.unit = unit_name
+
+    def _run(self, *args, check=False):
+        return subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=check,
+        )
+
+    def is_active(self) -> bool:
+        r = self._run("systemctl", "is-active", "--quiet", self.unit)
+        return r.returncode == 0
+
+    def start(self) -> bool:
+        self._run("systemctl", "start", self.unit)
+        return self.is_active()
+
+    def stop(self) -> bool:
+        self._run("systemctl", "stop", self.unit)
+        return not self.is_active()
+
+    def _default_route_iface(self) -> str | None:
+        r = self._run("ip", "route")
+        for line in r.stdout.splitlines():
+            # Example: "default via 10.8.0.1 dev tun0 ..."
+            if line.startswith("default "):
+                parts = line.split()
+                if "dev" in parts:
+                    try:
+                        idx = parts.index("dev")
+                        return parts[idx + 1]
+                    except Exception:
+                        pass
+        return None
+
+    def has_tun(self) -> bool:
+        # Prefer default route through tun*, but accept the presence of tun for split-tunneling
+        iface = self._default_route_iface()
+        if iface and iface.startswith("tun"):
+            return True
+        # fallback: check if any tun exists at all
+        r = self._run("ip", "addr")
+        return " tun0:" in r.stdout or " tun" in r.stdout
+
+    def ensure_connected(self, timeout_s=20) -> bool:
+        if self.is_active() and self.has_tun():
+            return True
+        self.start()
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if self.is_active() and self.has_tun():
+                return True
+            time.sleep(0.5)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # OPML export helpers (NEW)
 # ---------------------------------------------------------------------------
 
@@ -389,6 +467,13 @@ class BrowserPane(QWidget):
         self.opml_button = QPushButton("Outline (OPML export)")  # NEW button
         self.throbber = ThrobberWidget(size=24)
 
+        # --- VPN UI (button + status) ---
+        self.vpn = VPNController()
+        self.require_vpn = False
+        self.vpn_button = QPushButton("VPN")
+        self.vpn_button.setCheckable(True)
+        self.vpn_status = QLabel("●")
+
         self.status_label = QLabel("Ready.")
         self.status_label.setStyleSheet(
             "font-size: 11px; color: #d0e8ff; background-color: #003c5a; padding: 2px;"
@@ -422,8 +507,11 @@ class BrowserPane(QWidget):
             self.go_button,
             self.archive_button,
             self.opml_button,  # style new button
+            self.vpn_button,
         ):
             b.setStyleSheet(btn_style)
+
+        self.vpn_status.setStyleSheet("color: red; padding-left:6px;")
 
         self.url_bar.setStyleSheet(
             "QLineEdit {"
@@ -444,6 +532,9 @@ class BrowserPane(QWidget):
         toolbar_row.addWidget(self.go_button)
         toolbar_row.addWidget(self.archive_button)
         toolbar_row.addWidget(self.opml_button)  # add to toolbar
+        # Insert VPN controls before the throbber
+        toolbar_row.addWidget(self.vpn_button)
+        toolbar_row.addWidget(self.vpn_status)
         toolbar_row.addWidget(self.throbber)
 
         status_row = QHBoxLayout()
@@ -475,8 +566,34 @@ class BrowserPane(QWidget):
         self.view.loadProgress.connect(self._on_load_progress)
         self.view.loadFinished.connect(self._on_load_finished)
 
+        # VPN events
+        self.vpn_button.toggled.connect(self._toggle_vpn)
+        self.vpn_timer = QTimer(self)
+        self.vpn_timer.timeout.connect(self._refresh_vpn_status)
+        self.vpn_timer.start(1500)
+
         self.url_bar.setText(self.home_url)
         self.load_url()
+
+    def _toggle_vpn(self, checked: bool):
+        self.require_vpn = checked
+        if checked:
+            threading.Thread(target=self._bring_vpn_up, daemon=True).start()
+        else:
+            self.vpn.stop()
+            self._refresh_vpn_status()
+
+    def _bring_vpn_up(self):
+        ok = self.vpn.ensure_connected(timeout_s=25)
+        self.status_label.setText("VPN connected" if ok else "VPN connection failed")
+        self._refresh_vpn_status()
+
+    def _refresh_vpn_status(self):
+        active = self.vpn.is_active()
+        has_tun = self.vpn.has_tun()
+        color = "green" if (active and has_tun) else ("orange" if active else "red")
+        self.vpn_status.setStyleSheet(f"color: {color}; padding-left:6px;")
+        self.vpn_status.setToolTip(f"VPN: {'active' if active else 'inactive'}; tun: {'present' if has_tun else 'missing'}")
 
     def load_home(self):
         self.url_bar.setText(self.home_url)
@@ -486,6 +603,12 @@ class BrowserPane(QWidget):
         url = self.url_bar.text().strip()
         if not url.startswith("http"):
             url = "https://" + url
+
+        if self.require_vpn:
+            if not (self.vpn.is_active() and self.vpn.has_tun()):
+                self.status_label.setText("Waiting for VPN…")
+                threading.Thread(target=self._bring_vpn_up, daemon=True).start()
+                return  # do not navigate until VPN is up
         self.view.setUrl(QUrl(url))
 
     def load_html_snapshot(self, html: str, base_url: str):
@@ -1144,8 +1267,8 @@ class AssistantPane(QWidget):
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(guide_label)
         layout.addLayout(top_row)
+        layout.addWidget(guide_label)
         layout.addWidget(QLabel("Assistant Response:"))
         layout.addWidget(self.output_box, stretch=1)
         self.setLayout(layout)
@@ -1258,3 +1381,4 @@ if __name__ == "__main__":
 
 # Optional: expose DB_PATH for other modules if they want it.
 __all__ = ["init_db_if_needed", "DB_PATH"]
+
