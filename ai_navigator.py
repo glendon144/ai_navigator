@@ -2,10 +2,10 @@
 #
 # ai_navigator.py
 #
-# AI Navigator prototype (Archive + Recover + Reader Mode + OPML Outline + Reload + Recover-to-ChatGPT + Recover Memory Weave)
+# AI Navigator prototype (Archive + Recover + Reader Mode + OPML Outline + Reload + Recover-to-ChatGPT + Recover Memory Weave + Memory Pane)
 #
 # Layout:
-#   [ BrowserPane | ResultsPane | OutlinePane | AssistantPane ]
+#   [ BrowserPane | ResultsPane | OutlinePane | MemoryPane ]
 #
 # Capabilities:
 #   - Archive: capture current page into SQLite (raw + Reader Mode clean_html).
@@ -17,6 +17,7 @@
 #       Clicking a node with _local_id pulls that snapshot from SQLite
 #       and renders it offline in BrowserPane.
 #   - Reload Outline: re-parse archive_export.opml without restarting.
+#   - Memory Pane: separate memory.db that logs URL/title/html on each page load.
 #
 # You are now browsing history, not the feed.
 
@@ -51,7 +52,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QGuiApplication,
     QDesktopServices,
-    QClipboard,  # added for Selection mode
+    QClipboard,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -71,21 +72,30 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from bs4 import BeautifulSoup  # NEW: for OPML export parsing
+from bs4 import BeautifulSoup  # for OPML export parsing
 
 # Initializes storage/ and ensures archive_pages exists (same schema used below).
-# This module is already part of your project.
 from init_db import init_db_if_needed
 
 init_db_if_needed()
 
-# IMPORTANT: Your DB is created in storage/search_time_machine.db by init_db.py.
-# Keep this path in sync with that module.
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+# Main archive DB (unchanged)
 DB_PATH = Path("storage") / "search_time_machine.db"
 DEFAULT_OPML_PATH = "archive_export.opml"
 
+# Separate memory DB (M1)
+MEMORY_DB_PATH = Path("memory.db")
+
 K_WEAVE = 3  # Recover Memory Weave count
 
+
+# ---------------------------------------------------------------------------
+# Archive DB helpers (archive_pages)
+# ---------------------------------------------------------------------------
 
 def ensure_archive_table(db_path: Path):
     """
@@ -190,9 +200,72 @@ def save_archive_page(db_path: Path, url: str, title: str, html: str):
 
 
 # ---------------------------------------------------------------------------
-# Clipboard helper (Qt + X11 fallbacks)  [FIXED for PySide6]
+# Memory DB helpers (memory.db)
 # ---------------------------------------------------------------------------
 
+def ensure_memory_table(db_path: Path):
+    """
+    Simple memory table for the Memory Pane:
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT,
+        title TEXT,
+        timestamp TEXT,
+        raw_html TEXT
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT,
+            title TEXT,
+            timestamp TEXT,
+            raw_html TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_memory_entry(db_path: Path, url: str, title: str, raw_html: str):
+    ensure_memory_table(db_path)
+    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO memory_entries (url, title, timestamp, raw_html)
+        VALUES (?, ?, ?, ?);
+        """,
+        (url, title, ts, raw_html),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_memory_entries(db_path: Path, limit: int = 200):
+    ensure_memory_table(db_path)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, url, title, timestamp
+        FROM memory_entries
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Clipboard helper (Qt + X11 fallbacks)
+# ---------------------------------------------------------------------------
 
 def copy_to_clipboard(text: str) -> bool:
     """
@@ -203,9 +276,7 @@ def copy_to_clipboard(text: str) -> bool:
     try:
         cb = QGuiApplication.clipboard()
         if cb is not None:
-            # Default clipboard
             cb.setText(text or "")
-            # Primary selection for X11 (ignore if unsupported)
             try:
                 cb.setText(text or "", mode=QClipboard.Mode.Selection)
             except Exception:
@@ -217,7 +288,6 @@ def copy_to_clipboard(text: str) -> bool:
     if ok:
         return True
 
-    # X11 fallbacks (no harm if not installed)
     for cmd in (
         ["xclip", "-selection", "clipboard"],
         ["xsel", "--clipboard", "--input"],
@@ -237,20 +307,13 @@ def copy_to_clipboard(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# OpenVPN controller (systemd-managed openvpn-client@ainav.service)
+# OpenVPN controller
 # ---------------------------------------------------------------------------
-
 
 class VPNController:
     """
     Minimal controller for a single OpenVPN client managed by systemd:
       openvpn-client@ainav.service
-
-    Exposes:
-      - is_active(): systemd thinks VPN is running
-      - has_tun(): a tun interface is present / default route via tun
-      - start(), stop()
-      - ensure_connected(timeout_s=20)
     """
 
     def __init__(self, unit_name="openvpn-client@ainav"):
@@ -280,7 +343,6 @@ class VPNController:
     def _default_route_iface(self) -> str | None:
         r = self._run("ip", "route")
         for line in r.stdout.splitlines():
-            # Example: "default via 10.8.0.1 dev tun0 ..."
             if line.startswith("default "):
                 parts = line.split()
                 if "dev" in parts:
@@ -292,11 +354,9 @@ class VPNController:
         return None
 
     def has_tun(self) -> bool:
-        # Prefer default route through tun*, but accept the presence of tun for split-tunneling
         iface = self._default_route_iface()
         if iface and iface.startswith("tun"):
             return True
-        # fallback: check if any tun exists at all
         r = self._run("ip", "addr")
         return " tun0:" in r.stdout or " tun" in r.stdout
 
@@ -313,9 +373,8 @@ class VPNController:
 
 
 # ---------------------------------------------------------------------------
-# OPML export helpers (NEW)
+# OPML export helpers
 # ---------------------------------------------------------------------------
-
 
 def _slug(s: str) -> str:
     s = re.sub(r"\s+", "-", (s or "").strip())
@@ -356,6 +415,10 @@ def _html_to_opml(html: str, title: str) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Throbber
+# ---------------------------------------------------------------------------
+
 class ThrobberWidget(QWidget):
     """
     Rotating "A" throbber for AI Navigator.
@@ -367,7 +430,7 @@ class ThrobberWidget(QWidget):
         self.angle = 0
 
         self.timer = QTimer(self)
-        self.timer.setInterval(50)  # ~20 FPS
+        self.timer.setInterval(50)
         self.timer.timeout.connect(self._tick)
 
         self.base_pixmap = self._make_base_pixmap(size)
@@ -441,19 +504,26 @@ class ThrobberWidget(QWidget):
         painter.end()
 
 
+# ---------------------------------------------------------------------------
+# Browser Pane
+# ---------------------------------------------------------------------------
+
 class BrowserPane(QWidget):
     """
     Left pane:
-      Toolbar (Back, Forward, Reload, Home, URL, Go, Archive, Throbber)
+      Toolbar (Back, Forward, Reload, Home, URL, Go, Archive, OPML export, VPN, Throbber)
       QWebEngineView
       Status line
+
+    New: on_memory_log callback for Memory Pane.
     """
 
-    def __init__(self, on_page_loaded=None, on_archive_request=None):
+    def __init__(self, on_page_loaded=None, on_archive_request=None, on_memory_log=None):
         super().__init__()
 
         self.on_page_loaded = on_page_loaded
         self.on_archive_request = on_archive_request
+        self.on_memory_log = on_memory_log
 
         self.view = QWebEngineView()
 
@@ -464,10 +534,10 @@ class BrowserPane(QWidget):
         self.reload_button = QPushButton("Reload")
         self.home_button = QPushButton("Home")
         self.archive_button = QPushButton("Archive")
-        self.opml_button = QPushButton("Outline (OPML export)")  # NEW button
+        self.opml_button = QPushButton("Outline (OPML export)")
         self.throbber = ThrobberWidget(size=24)
 
-        # --- VPN UI (button + status) ---
+        # --- VPN UI ---
         self.vpn = VPNController()
         self.require_vpn = False
         self.vpn_button = QPushButton("VPN")
@@ -506,7 +576,7 @@ class BrowserPane(QWidget):
             self.home_button,
             self.go_button,
             self.archive_button,
-            self.opml_button,  # style new button
+            self.opml_button,
             self.vpn_button,
         ):
             b.setStyleSheet(btn_style)
@@ -531,8 +601,7 @@ class BrowserPane(QWidget):
         toolbar_row.addWidget(self.url_bar, stretch=1)
         toolbar_row.addWidget(self.go_button)
         toolbar_row.addWidget(self.archive_button)
-        toolbar_row.addWidget(self.opml_button)  # add to toolbar
-        # Insert VPN controls before the throbber
+        toolbar_row.addWidget(self.opml_button)
         toolbar_row.addWidget(self.vpn_button)
         toolbar_row.addWidget(self.vpn_status)
         toolbar_row.addWidget(self.throbber)
@@ -560,13 +629,12 @@ class BrowserPane(QWidget):
         self.reload_button.clicked.connect(self.view.reload)
         self.home_button.clicked.connect(self.load_home)
         self.archive_button.clicked.connect(self._archive_current_page)
-        self.opml_button.clicked.connect(self._export_outline_opml)  # NEW
+        self.opml_button.clicked.connect(self._export_outline_opml)
 
         self.view.loadStarted.connect(self._on_load_started)
         self.view.loadProgress.connect(self._on_load_progress)
         self.view.loadFinished.connect(self._on_load_finished)
 
-        # VPN events
         self.vpn_button.toggled.connect(self._toggle_vpn)
         self.vpn_timer = QTimer(self)
         self.vpn_timer.timeout.connect(self._refresh_vpn_status)
@@ -575,6 +643,7 @@ class BrowserPane(QWidget):
         self.url_bar.setText(self.home_url)
         self.load_url()
 
+    # VPN helpers
     def _toggle_vpn(self, checked: bool):
         self.require_vpn = checked
         if checked:
@@ -593,7 +662,9 @@ class BrowserPane(QWidget):
         has_tun = self.vpn.has_tun()
         color = "green" if (active and has_tun) else ("orange" if active else "red")
         self.vpn_status.setStyleSheet(f"color: {color}; padding-left:6px;")
-        self.vpn_status.setToolTip(f"VPN: {'active' if active else 'inactive'}; tun: {'present' if has_tun else 'missing'}")
+        self.vpn_status.setToolTip(
+            f"VPN: {'active' if active else 'inactive'}; tun: {'present' if has_tun else 'missing'}"
+        )
 
     def load_home(self):
         self.url_bar.setText(self.home_url)
@@ -608,7 +679,7 @@ class BrowserPane(QWidget):
             if not (self.vpn.is_active() and self.vpn.has_tun()):
                 self.status_label.setText("Waiting for VPN…")
                 threading.Thread(target=self._bring_vpn_up, daemon=True).start()
-                return  # do not navigate until VPN is up
+                return
         self.view.setUrl(QUrl(url))
 
     def load_html_snapshot(self, html: str, base_url: str):
@@ -625,15 +696,33 @@ class BrowserPane(QWidget):
 
     def _on_load_finished(self, ok: bool):
         self.throbber.stop()
-        if ok:
-            current_url = self.view.url().toString()
-            self.url_bar.setText(current_url)
-            self.status_label.setText("Done.")
-            if self.on_page_loaded:
-                self.on_page_loaded(current_url)
-        else:
+        if not ok:
             self.status_label.setText("Load failed.")
             QMessageBox.warning(self, "Load error", "Page failed to load.")
+            return
+
+        current_url = self.view.url().toString()
+        self.url_bar.setText(current_url)
+        self.status_label.setText("Done.")
+
+        # Notify basic page-loaded event
+        if self.on_page_loaded:
+            self.on_page_loaded(current_url)
+
+        # Automatic memory logging (url, title, raw_html)
+        if self.on_memory_log:
+            def _got_html(html_str: str):
+                title = self.view.title() or current_url
+                self.on_memory_log(current_url, title, html_str)
+
+            self.view.page().toHtml(_got_html)
+
+    def load_from_memory(self, url: str):
+        """Load a URL initiated from the Memory Pane selection."""
+        if not url:
+            return
+        self.url_bar.setText(url)
+        self.load_url()
 
     def _archive_current_page(self):
         current_url = self.view.url().toString()
@@ -645,7 +734,7 @@ class BrowserPane(QWidget):
 
         self.view.page().toHtml(got_html)
 
-    # NEW: robust OPML export handler
+    # OPML export
     def _export_outline_opml(self):
         """Export the visible page's heading outline to ./archives/opml/*.opml"""
 
@@ -667,16 +756,13 @@ class BrowserPane(QWidget):
         self.view.page().toHtml(_on_html)
 
 
+# ---------------------------------------------------------------------------
+# Results Pane
+# ---------------------------------------------------------------------------
+
 class ResultsPane(QWidget):
     """
     Snapshot list pane.
-
-    Top: list of archived snapshots (title + timestamp).
-    Bottom: detail box (URL + snippet preview).
-    Buttons:
-      - Recover (load snapshot locally)
-      - Recover to ChatGPT (copy Capsule + open chatgpt.com)
-      - Recover Memory Weave (copy 3-item thread + open chatgpt.com)
     """
 
     recoveredPage = Signal(str, str)  # html, url
@@ -728,7 +814,6 @@ class ResultsPane(QWidget):
         layout.addWidget(header_label)
         layout.addWidget(self.archive_list, stretch=1)
 
-        # Row: Details label + buttons on the right
         details_header_row = QHBoxLayout()
         details_header_row.addWidget(details_label)
         details_header_row.addStretch(1)
@@ -823,7 +908,6 @@ class ResultsPane(QWidget):
         url, html_for_reader = row
         self.recoveredPage.emit(html_for_reader, url)
 
-    # --- Recover-to-ChatGPT: build a compact Context Capsule and open chatgpt.com ---
     def _recover_to_chatgpt_selected(self):
         try:
             if self.conn is None:
@@ -896,7 +980,6 @@ class ResultsPane(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Recover to ChatGPT failed", str(e))
 
-    # --- Recover Memory Weave: build a 3-item thread and open chatgpt.com ---
     def _recover_memory_weave_selected(self):
         try:
             if self.conn is None:
@@ -953,8 +1036,12 @@ class ResultsPane(QWidget):
         self._populate_archive_list()
 
 
+# ---------------------------------------------------------------------------
+# Capsule builders
+# ---------------------------------------------------------------------------
+
 def _clean_for_capsule(s: str) -> str:
-    s = s.replace("```", "ʼʼʼ")  # avoid nested fence breakage
+    s = s.replace("```", "ʼʼʼ")
     s = re.sub(r"\s+\n", "\n", s)
     return s.strip()
 
@@ -968,20 +1055,11 @@ def build_context_capsule_for_snapshot(
     body: str,
     hard_cap_chars: int = 6500,
 ) -> str:
-    """
-    Build a one-shot Markdown capsule suitable for pasting into a new ChatGPT chat.
-    We include:
-      - Header: title, URL, captured timestamp
-      - Brief snippet (plain text)
-      - Slice of cleaned Reader-Mode HTML (as fenced block), size-capped
-      - A tiny footer instruction so the assistant continues from context
-    """
     title = _clean_for_capsule(title)
     url = _clean_for_capsule(url)
     snippet = _clean_for_capsule(snippet)
     body = _clean_for_capsule(body)
 
-    # Keep a small portion of body for safety; HTML can be long.
     max_body = max(0, min(5200, hard_cap_chars - 1000))
     body_slice = body[:max_body]
 
@@ -1006,7 +1084,6 @@ def build_context_capsule_for_snapshot(
     )
 
     capsule = header + snippet_block + html_block + footer
-    # Final additional cap if somehow exceeded
     if len(capsule) > hard_cap_chars:
         capsule = capsule[: hard_cap_chars - 25] + "\n…[truncated]…"
     return capsule
@@ -1018,22 +1095,14 @@ def build_memory_weave_packet(
     k: int = 3,
     hard_cap_chars: int = 7000,
 ) -> str:
-    """
-    Build a 3-item "Memory Weave" capsule:
-      - Prefer the last k captures from the SAME DOMAIN as the selected item.
-      - If fewer than k exist, fall back to global recents to fill up.
-      - Include title, URL, timestamp, and a short snippet for each.
-    """
     cur = conn.cursor()
 
-    # Fetch the selected page info
     cur.execute(
         "SELECT url, title, captured_at, snippet FROM archive_pages WHERE id = ?;",
         (current_page_id,),
     )
     row = cur.fetchone()
     if not row:
-        # Fallback: just use the latest k globally
         return build_global_weave_packet(conn, k=k, hard_cap_chars=hard_cap_chars)
 
     sel_url, sel_title, sel_captured_at, sel_snippet = row
@@ -1041,13 +1110,12 @@ def build_memory_weave_packet(
 
     items = []
 
-    # Prefer same-domain recents
     if domain:
         cur.execute(
             """
             SELECT id, title, url, captured_at, snippet
             FROM archive_pages
-            WHERE url LIKE ? 
+            WHERE url LIKE ?
             ORDER BY captured_at DESC
             LIMIT ?;
             """,
@@ -1055,7 +1123,6 @@ def build_memory_weave_packet(
         )
         items = cur.fetchall()
 
-    # If not enough, top up with global recents excluding duplicates
     if len(items) < k:
         have_ids = {r[0] for r in items}
         need = k - len(items)
@@ -1066,7 +1133,7 @@ def build_memory_weave_packet(
             ORDER BY captured_at DESC
             LIMIT ?;
             """,
-            (k * 3,),  # grab a bit more to avoid dup fill
+            (k * 3,),
         )
         for r in cur.fetchall():
             if r[0] not in have_ids:
@@ -1074,7 +1141,6 @@ def build_memory_weave_packet(
                 if len(items) >= k:
                     break
 
-    # Build the weave text
     header = "### Context Capsule — ai_navigator\n"
     if domain:
         header += f"Thread scope: {domain}\n"
@@ -1105,9 +1171,6 @@ def build_memory_weave_packet(
 def build_global_weave_packet(
     conn: sqlite3.Connection, k: int = 3, hard_cap_chars: int = 7000
 ) -> str:
-    """
-    Fallback when selected item missing: global last k recents.
-    """
     cur = conn.cursor()
     cur.execute(
         """
@@ -1144,6 +1207,10 @@ def build_global_weave_packet(
         capsule = capsule[: hard_cap_chars - 25] + "\n…[truncated]…"
     return capsule
 
+
+# ---------------------------------------------------------------------------
+# Outline Pane
+# ---------------------------------------------------------------------------
 
 class OutlinePane(QWidget):
     """
@@ -1242,58 +1309,128 @@ class OutlinePane(QWidget):
                 pass
 
 
-class AssistantPane(QWidget):
+# ---------------------------------------------------------------------------
+# Memory Pane (replaces AssistantPane)
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Memory Pane (Session → Domain → Page, Tree-Based — fixed)
+# ---------------------------------------------------------------------------
+class MemoryPane(QWidget):
     """
-    Assistant / commentary pane (placeholder UI).
+    Memory Pane (Tree-Based):
+      Session (per hour) → Domain → Page entries
     """
 
-    def __init__(self):
+    openUrlRequested = Signal(str)
+
+    def __init__(self, db_path: Path):
         super().__init__()
+        self.db_path = db_path
 
-        self.input_line = QLineEdit()
-        self.ask_button = QPushButton("Ask")
-        self.output_box = QTextEdit()
-        self.output_box.setReadOnly(True)
-
-        guide_label = QLabel("Navigator Guide")
-        guide_label.setStyleSheet(
-            "font-weight: bold; background-color: #003c5a; color: #ffffff; padding: 4px;"
+        # Header
+        header_label = QLabel("Memory Tree")
+        header_label.setStyleSheet(
+            "font-weight: bold; background-color: #003c5a; "
+            "color: #ffffff; padding: 4px;"
         )
 
-        top_row = QHBoxLayout()
-        top_row.addWidget(QLabel("Ask:"))
-        top_row.addWidget(self.input_line)
-        top_row.addWidget(self.ask_button)
+        # Tree widget
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setStyleSheet(
+            "background-color: #1e1e1e; color: #c0ffc0; "
+            "font-family: monospace;"
+        )
+
+        # Refresh button
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #195b7e;"
+            "  color: #ffffff;"
+            "  border: 1px solid #99ccee;"
+            "  padding: 3px 6px;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton:pressed { background-color: #0f3b52; }"
+        )
+
+        # Layout
+        header_row = QHBoxLayout()
+        header_row.addWidget(header_label)
+        header_row.addStretch(1)
+        header_row.addWidget(self.refresh_button)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addLayout(top_row)
-        layout.addWidget(guide_label)
-        layout.addWidget(QLabel("Assistant Response:"))
-        layout.addWidget(self.output_box, stretch=1)
+        layout.addLayout(header_row)
+        layout.addWidget(self.tree, stretch=1)
         self.setLayout(layout)
 
-        self.ask_button.clicked.connect(self.handle_ask)
-        self.input_line.returnPressed.connect(self.handle_ask)
+        # Wire button
+        self.refresh_button.clicked.connect(self.refresh)
+        self.tree.itemClicked.connect(self._handle_item_click)
+        self.refresh()
 
-    def handle_ask(self):
-        question = self.input_line.text().strip()
-        if not question:
-            return
-        response_text = (
-            "AI Navigator says:\n\n"
-            "The Outline pane is live-updating. Regenerate the OPML, hit Reload, "
-            "and keep exploring snapshots without restarting.\n\n"
-            "Soon: pick two captures of the same URL and I'll diff them so you can "
-            "watch the narrative mutate over time."
-        )
-        self.output_box.setPlainText(response_text)
+    # ------------------------------------------------------------------
+    # Render Memory Tree
+    # ------------------------------------------------------------------
+    def refresh(self):
+        rows = load_memory_entries(self.db_path, limit=200)
+        self.tree.clear()
 
+        # sessions = { session_hour: { domain: [(mid,title,url,ts), ...] } }
+        sessions = {}
+
+        for mid, url, title, ts in rows:
+            if not ts:
+                continue
+
+            # Normalize timestamps to the hour
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", ""))
+                session_key = dt.strftime("%Y-%m-%d %H:00")
+            except Exception:
+                session_key = "Unknown Session"
+
+            domain = urlparse(url).netloc or "unknown-domain"
+
+            sessions.setdefault(session_key, {})
+            sessions[session_key].setdefault(domain, [])
+            sessions[session_key][domain].append((mid, title or "(No title)", url, ts))
+
+        # Build display tree
+        for session_key in sorted(sessions.keys(), reverse=True):
+            session_item = QTreeWidgetItem([session_key])
+            self.tree.addTopLevelItem(session_item)
+
+            for domain in sorted(sessions[session_key].keys()):
+                domain_item = QTreeWidgetItem([domain])
+                session_item.addChild(domain_item)
+
+                for mid, title, url, ts in sessions[session_key][domain]:
+                    label = f"[{mid}] {title}"
+                    page_item = QTreeWidgetItem([label])
+                    page_item.setToolTip(0, url)
+                    domain_item.addChild(page_item)
+
+        self.tree.expandToDepth(1)
+
+    def _handle_item_click(self, item, column):
+        """When a leaf (page) is clicked, emit its URL for the browser to load."""
+        url = item.toolTip(0)
+        if url:
+            self.openUrlRequested.emit(url)
+
+
+    # ---------------------------------------------------------------------------
+# Main Window
+# ---------------------------------------------------------------------------
 
 class MainWindow(QWidget):
     """
     4-pane layout:
-      BrowserPane | ResultsPane | OutlinePane | AssistantPane
+      BrowserPane | ResultsPane | OutlinePane | MemoryPane
     """
 
     def __init__(self):
@@ -1303,10 +1440,11 @@ class MainWindow(QWidget):
         self.setMinimumSize(QSize(1600, 900))
 
         self.results_pane = ResultsPane(DB_PATH)
-        self.assistant_pane = AssistantPane()
+        self.memory_pane = MemoryPane(MEMORY_DB_PATH)
         self.browser_pane = BrowserPane(
             on_page_loaded=self._handle_page_loaded,
             on_archive_request=self._handle_archive_request,
+            on_memory_log=self._handle_memory_log,
         )
         self.outline_pane = OutlinePane(
             DB_PATH,
@@ -1315,11 +1453,12 @@ class MainWindow(QWidget):
         )
 
         self.results_pane.recoveredPage.connect(self._handle_recovered_page)
+        self.memory_pane.openUrlRequested.connect(self.browser_pane.load_from_memory)
 
         mid_splitter = QSplitter(Qt.Horizontal)
         mid_splitter.addWidget(self.results_pane)
         mid_splitter.addWidget(self.outline_pane)
-        mid_splitter.addWidget(self.assistant_pane)
+        mid_splitter.addWidget(self.memory_pane)
         mid_splitter.setSizes([300, 300, 400])
 
         outer_splitter = QSplitter(Qt.Horizontal)
@@ -1339,8 +1478,12 @@ class MainWindow(QWidget):
     def _handle_archive_request(self, url: str, title: str, html: str):
         save_archive_page(DB_PATH, url, title, html)
         self.results_pane.refresh_all()
-        # After you regenerate archive_export.opml externally,
+        # After regenerating archive_export.opml externally,
         # hit "Reload" in OutlinePane to see new items.
+
+    def _handle_memory_log(self, url: str, title: str, html: str):
+        log_memory_entry(MEMORY_DB_PATH, url, title, html)
+        self.memory_pane.refresh()
 
     def _handle_recovered_page(self, html: str, url: str):
         self.browser_pane.load_html_snapshot(html, url)
@@ -1367,8 +1510,11 @@ class MainWindow(QWidget):
         self.browser_pane.load_html_snapshot(html_for_reader, url or "about:blank")
 
 
+# ---------------------------------------------------------------------------
+# main()
+# ---------------------------------------------------------------------------
+
 def main():
-    # Helps on some Linux desktops where WebEngine sandbox trips:
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox")
     app = QApplication(sys.argv)
     w = MainWindow()
