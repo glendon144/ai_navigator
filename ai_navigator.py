@@ -19,6 +19,12 @@
 #   - Reload Outline: re-parse archive_export.opml without restarting.
 #   - Memory Pane: separate memory.db that logs URL/title/html on each page load.
 #
+# NEW (M2): Capture BOTH panes for ChatGPT-like layouts:
+#   - Save full WebEngine screenshot
+#   - Save left-pane crop (sidebar)
+#   - Save right-pane crop (main content)
+#   - Save full BrowserPane window screenshot (toolbar + webview)
+#
 # You are now browsing history, not the feed.
 
 import sys
@@ -90,7 +96,21 @@ DEFAULT_OPML_PATH = "archive_export.opml"
 # Separate memory DB (M1)
 MEMORY_DB_PATH = Path("memory.db")
 
+# NEW: screenshot output dir
+MEMORY_FRAMES_DIR = Path("storage") / "memory_frames"
+
 K_WEAVE = 3  # Recover Memory Weave count
+
+# Capture controls
+CAPTURE_PANES = True         # split webview into left/right crops
+CAPTURE_FULL_WEBVIEW = True  # full webview screenshot
+CAPTURE_FULL_WINDOW = True   # BrowserPane screenshot (toolbar + webview)
+
+# Sidebar split heuristic (used when CAPTURE_PANES is True)
+# ChatGPT sidebar is often ~280–360px; we pick a ratio and clamp.
+PANE_SPLIT_RATIO = 0.28
+PANE_SPLIT_MIN_PX = 260
+PANE_SPLIT_MAX_PX = 440
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +231,12 @@ def ensure_memory_table(db_path: Path):
         title TEXT,
         timestamp TEXT,
         raw_html TEXT
+
+    NEW (M2):
+        shot_webview TEXT,
+        shot_left TEXT,
+        shot_right TEXT,
+        shot_window TEXT
     """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -225,21 +251,40 @@ def ensure_memory_table(db_path: Path):
         );
         """
     )
+
+    # Add screenshot columns if missing (safe/no-op if present)
+    for col in ("shot_webview", "shot_left", "shot_right", "shot_window"):
+        try:
+            cur.execute(f"ALTER TABLE memory_entries ADD COLUMN {col} TEXT;")
+        except sqlite3.OperationalError:
+            pass
+
     conn.commit()
     conn.close()
 
 
-def log_memory_entry(db_path: Path, url: str, title: str, raw_html: str):
+def log_memory_entry(
+    db_path: Path,
+    url: str,
+    title: str,
+    raw_html: str,
+    *,
+    shot_webview: str | None = None,
+    shot_left: str | None = None,
+    shot_right: str | None = None,
+    shot_window: str | None = None,
+    timestamp_iso: str | None = None,
+):
     ensure_memory_table(db_path)
-    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    ts = timestamp_iso or (datetime.utcnow().isoformat(timespec="seconds") + "Z")
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO memory_entries (url, title, timestamp, raw_html)
-        VALUES (?, ?, ?, ?);
+        INSERT INTO memory_entries (url, title, timestamp, raw_html, shot_webview, shot_left, shot_right, shot_window)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         """,
-        (url, title, ts, raw_html),
+        (url, title, ts, raw_html, shot_webview, shot_left, shot_right, shot_window),
     )
     conn.commit()
     conn.close()
@@ -304,6 +349,51 @@ def copy_to_clipboard(text: str) -> bool:
         except Exception:
             continue
     return False
+
+
+# ---------------------------------------------------------------------------
+# Screenshot helpers
+# ---------------------------------------------------------------------------
+
+def _safe_slug(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s)
+    return s.strip("-") or "page"
+
+
+def _timestamp_for_filename():
+    # e.g. 20260208T070246Z
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+
+def _ensure_frames_dir():
+    try:
+        MEMORY_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _guess_split_x(total_w: int) -> int:
+    x = int(total_w * PANE_SPLIT_RATIO)
+    x = max(PANE_SPLIT_MIN_PX, min(PANE_SPLIT_MAX_PX, x))
+    # Avoid degenerate splits
+    if x < 50:
+        x = 50
+    if x > total_w - 50:
+        x = max(50, total_w // 2)
+    return x
+
+
+def _save_pixmap(pm: QPixmap, path: Path) -> str | None:
+    try:
+        if pm is None or pm.isNull():
+            return None
+        _ensure_frames_dir()
+        ok = pm.save(str(path))
+        return str(path) if ok else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +784,65 @@ class BrowserPane(QWidget):
     def _on_load_progress(self, pct: int):
         self.status_label.setText(f"Transferring data... {pct}%")
 
+    def _capture_frames(self, current_url: str, title: str) -> dict:
+        """
+        Capture:
+          - full webview
+          - left/right crops (both panes)
+          - full BrowserPane window
+        Returns dict with optional file paths.
+        """
+        shots = {"shot_webview": None, "shot_left": None, "shot_right": None, "shot_window": None}
+
+        try:
+            _ensure_frames_dir()
+            ts_file = _timestamp_for_filename()
+            domain = urlparse(current_url or "").netloc or "unknown-domain"
+            domain_slug = _safe_slug(domain)
+            title_slug = _safe_slug(title or domain)
+
+            # Full webview screenshot
+            web_pm = None
+            try:
+                web_pm = self.view.grab()
+            except Exception:
+                web_pm = None
+
+            if CAPTURE_FULL_WEBVIEW and web_pm is not None and not web_pm.isNull():
+                p = MEMORY_FRAMES_DIR / f"{ts_file}_{domain_slug}_{title_slug}_webview.png"
+                shots["shot_webview"] = _save_pixmap(web_pm, p)
+
+            # Left/right crops (both panes)
+            if CAPTURE_PANES and web_pm is not None and not web_pm.isNull():
+                w = web_pm.width()
+                h = web_pm.height()
+                split_x = _guess_split_x(w)
+
+                left = web_pm.copy(QRect(0, 0, split_x, h))
+                right = web_pm.copy(QRect(split_x, 0, w - split_x, h))
+
+                pL = MEMORY_FRAMES_DIR / f"{ts_file}_{domain_slug}_{title_slug}_left.png"
+                pR = MEMORY_FRAMES_DIR / f"{ts_file}_{domain_slug}_{title_slug}_right.png"
+
+                shots["shot_left"] = _save_pixmap(left, pL)
+                shots["shot_right"] = _save_pixmap(right, pR)
+
+            # Full BrowserPane window screenshot (toolbar + webview)
+            if CAPTURE_FULL_WINDOW:
+                try:
+                    win_pm = self.grab()
+                    if win_pm is not None and not win_pm.isNull():
+                        pW = MEMORY_FRAMES_DIR / f"{ts_file}_{domain_slug}_{title_slug}_window.png"
+                        shots["shot_window"] = _save_pixmap(win_pm, pW)
+                except Exception:
+                    pass
+
+        except Exception:
+            # Never break navigation if capture fails
+            pass
+
+        return shots
+
     def _on_load_finished(self, ok: bool):
         self.throbber.stop()
         if not ok:
@@ -709,11 +858,22 @@ class BrowserPane(QWidget):
         if self.on_page_loaded:
             self.on_page_loaded(current_url)
 
-        # Automatic memory logging (url, title, raw_html)
+        # Automatic memory logging (url, title, raw_html + screenshots)
         if self.on_memory_log:
+            # Capture frames NOW (pixel truth), then attach toHtml when it returns.
+            title_now = self.view.title() or current_url
+            shots = self._capture_frames(current_url, title_now)
+            ts_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
             def _got_html(html_str: str):
                 title = self.view.title() or current_url
-                self.on_memory_log(current_url, title, html_str)
+                self.on_memory_log(
+                    current_url,
+                    title,
+                    html_str,
+                    shots=shots,
+                    timestamp_iso=ts_iso,
+                )
 
             self.view.page().toHtml(_got_html)
 
@@ -1310,11 +1470,9 @@ class OutlinePane(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Memory Pane (replaces AssistantPane)
+# Memory Pane (Session → Domain → Page, Tree-Based)
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Memory Pane (Session → Domain → Page, Tree-Based — fixed)
-# ---------------------------------------------------------------------------
+
 class MemoryPane(QWidget):
     """
     Memory Pane (Tree-Based):
@@ -1372,9 +1530,6 @@ class MemoryPane(QWidget):
         self.tree.itemClicked.connect(self._handle_item_click)
         self.refresh()
 
-    # ------------------------------------------------------------------
-    # Render Memory Tree
-    # ------------------------------------------------------------------
     def refresh(self):
         rows = load_memory_entries(self.db_path, limit=200)
         self.tree.clear()
@@ -1423,7 +1578,7 @@ class MemoryPane(QWidget):
             self.openUrlRequested.emit(url)
 
 
-    # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -1481,8 +1636,19 @@ class MainWindow(QWidget):
         # After regenerating archive_export.opml externally,
         # hit "Reload" in OutlinePane to see new items.
 
-    def _handle_memory_log(self, url: str, title: str, html: str):
-        log_memory_entry(MEMORY_DB_PATH, url, title, html)
+    def _handle_memory_log(self, url: str, title: str, html: str, *, shots=None, timestamp_iso=None):
+        shots = shots or {}
+        log_memory_entry(
+            MEMORY_DB_PATH,
+            url,
+            title,
+            html,
+            shot_webview=shots.get("shot_webview"),
+            shot_left=shots.get("shot_left"),
+            shot_right=shots.get("shot_right"),
+            shot_window=shots.get("shot_window"),
+            timestamp_iso=timestamp_iso,
+        )
         self.memory_pane.refresh()
 
     def _handle_recovered_page(self, html: str, url: str):
